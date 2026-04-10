@@ -1,0 +1,14 @@
+kafka-python==2.0.2
+requests==2.31.0
+python-dotenv==1.0.0
+jsonschema==4.21.1
+pymongo==4.6.1
+streamlit==1.31.0
+pandas==2.2.0
+plotly==5.18.0
+schedule==1.2.1
+loguru==0.7.2
+pytest==8.0.0
+pytest-mock==3.12.0
+# Phase 2 – Spark stream processing
+pyspark==3.5.0

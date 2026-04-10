@@ -1,0 +1,9 @@
+# Phase 2 – additional dependencies for Spark processor containers.
+# pyspark is already present in bitnami/spark:3.5, so it is intentionally
+# omitted here to avoid version conflicts.
+kafka-python==2.0.2
+pymongo==4.6.1
+python-dotenv==1.0.0
+loguru==0.7.2
+pandas==2.2.0
+schedule==1.2.1

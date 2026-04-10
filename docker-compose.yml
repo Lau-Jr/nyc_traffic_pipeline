@@ -1,0 +1,240 @@
+version: "3.9"
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  TOPIC_TRAFFIC_RAW: traffic-raw
+  TOPIC_TRAFFIC_VALIDATED: traffic-validated
+  TOPIC_TRAFFIC_DLQ: traffic-dlq
+  POLL_INTERVAL_SECONDS: "60"
+  BATCH_LIMIT: "1000"
+  LOG_LEVEL: INFO
+
+x-phase2-env: &phase2-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  TOPIC_TRAFFIC_VALIDATED: traffic-validated
+  MONGO_URI: mongodb://mongodb:27017
+  MONGO_DB: nyc_traffic
+  TRIGGER_INTERVAL_SECONDS: "5"
+  BATCH_LOOKBACK_HOURS: "24"
+  BATCH_INTERVAL_MINUTES: "60"
+  CHECKPOINT_DIR: /app/checkpoints/stream
+  LOG_LEVEL: INFO
+
+services:
+
+  # ── 1. Zookeeper ───────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.3
+    container_name: nyc-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    networks:
+      - nyc-traffic-net
+
+  # ── 2. Kafka Broker ────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: nyc-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_MESSAGE_MAX_BYTES: 5242880
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - nyc-traffic-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  # ── 3. Kafka UI ────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: nyc-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: nyc-traffic-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - nyc-traffic-net
+
+  # ── 4. Topic Init (one-shot) ───────────────────────────────────
+  topic-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nyc-topic-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *kafka-env
+    command: ["python", "-c",
+              "from config.kafka_config import create_topics; create_topics()"]
+    networks:
+      - nyc-traffic-net
+    restart: "no"
+
+  # ── 5. Producer ────────────────────────────────────────────────
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nyc-producer
+    restart: unless-stopped
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *kafka-env
+      NYC_OPENDATA_APP_TOKEN: ${NYC_OPENDATA_APP_TOKEN:-}
+      NYC_DOT_SPEEDS_DATASET_ID: i4gi-tjb9
+      NYC_OPENDATA_BASE_URL: https://data.cityofnewyork.us/resource
+    command: ["python", "producers/traffic_producer.py"]
+    volumes:
+      - shared-logs:/app/logs       # shared with dashboard
+    networks:
+      - nyc-traffic-net
+
+  # ── 6. Validation Consumer ─────────────────────────────────────
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nyc-consumer
+    restart: unless-stopped
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *kafka-env
+    command: ["python", "consumers/validation_consumer.py"]
+    networks:
+      - nyc-traffic-net
+
+  # ── 7. Dashboard ───────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nyc-dashboard
+    restart: unless-stopped
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    ports:
+      - "8502:8502"
+    environment:
+      <<: *kafka-env
+      NYC_OPENDATA_APP_TOKEN: ${NYC_OPENDATA_APP_TOKEN:-}
+      NYC_DOT_SPEEDS_DATASET_ID: i4gi-tjb9
+      NYC_OPENDATA_BASE_URL: https://data.cityofnewyork.us/resource
+    command: [
+      "streamlit", "run", "monitoring/dashboard.py",
+      "--server.port", "8502",
+      "--server.address", "0.0.0.0",
+      "--server.headless", "true",
+      "--browser.gatherUsageStats", "false"
+    ]
+    volumes:
+      - shared-logs:/app/logs       # reads producer_stats.json written by producer
+    networks:
+      - nyc-traffic-net
+
+  # ── 8. MongoDB ─────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: nyc-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - nyc-traffic-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── 9. Spark Stream Processor ──────────────────────────────────
+  spark-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: nyc-spark-processor
+    restart: unless-stopped
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+    environment:
+      <<: *phase2-env
+    command: [
+      "python", "processors/spark_stream_processor.py"
+    ]
+    volumes:
+      - spark-checkpoints:/app/checkpoints
+      - shared-logs:/app/logs
+    networks:
+      - nyc-traffic-net
+
+  # ── 10. Batch Processor ────────────────────────────────────────
+  batch-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nyc-batch-processor
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *phase2-env
+    command: [
+      "python", "processors/batch_processor.py", "--loop"
+    ]
+    networks:
+      - nyc-traffic-net
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  mongodb-data:
+  spark-checkpoints:
+  shared-logs:                      # named volume shared between producer + dashboard
+
+networks:
+  nyc-traffic-net:
+    driver: bridge

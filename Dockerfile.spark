@@ -1,0 +1,33 @@
+# ── Dockerfile.spark ───────────────────────────────────────────────────────────
+# Phase 2 – Spark-enabled container for the stream and batch processors.
+#
+# Uses Bitnami Spark 3.5 as the base (includes Java 17 + Python 3.11 + Spark).
+# Our application code is layered on top.
+# ──────────────────────────────────────────────────────────────────────────────
+FROM bitnami/spark:3.5
+
+USER root
+
+# ── System dependencies ────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies ────────────────────────────────────────────────────────
+# Install only the packages that the processors need.
+# pyspark is already provided by the base image; we pin extras here.
+COPY requirements-phase2.txt /tmp/requirements-phase2.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-phase2.txt
+
+# ── Application code ───────────────────────────────────────────────────────────
+WORKDIR /app
+COPY . .
+
+# Directories the processor writes to at runtime
+RUN mkdir -p /app/checkpoints/stream /app/logs \
+    && chown -R 1001:1001 /app/checkpoints /app/logs
+
+# ── Runtime ────────────────────────────────────────────────────────────────────
+USER 1001
+ENV PYTHONPATH=/app
+ENV SPARK_HOME=/opt/bitnami/spark
