@@ -19,6 +19,20 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# ── Windows: point Spark workers at the current venv Python ───────────────────
+# Without this, Spark calls bare "python" which Windows aliases to the
+# Microsoft Store installer instead of the actual venv interpreter.
+os.environ["PYSPARK_PYTHON"]        = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+# ── Windows: set HADOOP_HOME so Spark can find winutils.exe ───────────────────
+# winutils.exe must exist at C:\hadoop\bin\winutils.exe
+# Download from: github.com/cdarlint/winutils → hadoop-3.3.5/bin/
+if sys.platform == "win32" and not os.environ.get("HADOOP_HOME"):
+    os.environ["HADOOP_HOME"] = r"C:\hadoop"
+if sys.platform == "win32":
+    os.environ["hadoop.home.dir"] = os.environ.get("HADOOP_HOME", r"C:\hadoop")
+
 from loguru import logger
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -34,7 +48,7 @@ PROCESSOR_VERSION = "2.0.0"
 
 SPARK_PACKAGES = (
     "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
-    "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1"
+    "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0"
 )
 
 
@@ -48,12 +62,14 @@ def build_spark_session():
         .appName("NYC-Traffic-Stream-Processor-v2")
         .master("local[*]")
         .config("spark.jars.packages",                   SPARK_PACKAGES)
+        .config("spark.jars.ivy",                        os.path.expanduser("~/.ivy2-spark"))
         .config("spark.mongodb.write.connection.uri",    MONGO_URI)
         .config("spark.driver.memory",                   "1g")
         .config("spark.executor.memory",                 "1g")
         .config("spark.sql.shuffle.partitions",          "4")
         .config("spark.ui.enabled",                      "false")
         .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_DIR)
+        .config("spark.hadoop.fs.file.impl",             "org.apache.hadoop.fs.RawLocalFileSystem")
         .getOrCreate()
     )
 
@@ -94,75 +110,18 @@ def get_raw_schema():
     ])
 
 
-# ── UDFs ───────────────────────────────────────────────────────────────────────
-
-def register_udfs(spark):
-    from pyspark.sql.functions import udf
-    from pyspark.sql.types import StringType, DoubleType
-
-    @udf(StringType())
-    def congestion_level_udf(speed):
-        if speed is None:
-            return "UNKNOWN"
-        if speed >= 35:
-            return "FREE_FLOW"
-        if speed >= 15:
-            return "MODERATE"
-        if speed >= 5:
-            return "CONGESTED"
-        return "SEVERE"
-
-    @udf(DoubleType())
-    def congestion_score_udf(speed):
-        if speed is None:
-            return None
-        return round(1.0 - min(speed / 60.0, 1.0), 4)
-
-    @udf(StringType())
-    def first_lat_udf(link_points):
-        if not link_points:
-            return None
-        try:
-            return link_points.strip().split(" ")[0].split(",")[0]
-        except Exception:
-            return None
-
-    @udf(StringType())
-    def first_lon_udf(link_points):
-        if not link_points:
-            return None
-        try:
-            return link_points.strip().split(" ")[0].split(",")[1]
-        except Exception:
-            return None
-
-    @udf(StringType())
-    def time_bucket_udf(hour_val, dow_val):
-        # dow_val: Spark dayofweek → 1=Sun, 7=Sat
-        if hour_val is None or dow_val is None:
-            return None
-        is_weekend = dow_val in (1, 7)
-        if 0 <= hour_val < 6:
-            return "OVERNIGHT"
-        if 7 <= hour_val < 9 and not is_weekend:
-            return "MORNING_PEAK"
-        if 17 <= hour_val < 19 and not is_weekend:
-            return "EVENING_PEAK"
-        return "OFF_PEAK"
-
-    return congestion_level_udf, congestion_score_udf, first_lat_udf, first_lon_udf, time_bucket_udf
-
-
 # ── Streaming DataFrame ────────────────────────────────────────────────────────
+# All transformations use native Spark SQL functions (no Python UDFs) so that
+# no Python worker sub-processes are spawned — avoids Windows socket-timeout
+# issues caused by spaces in the project path.
 
-def build_streaming_df(spark, udfs):
+def build_streaming_df(spark):
     from pyspark.sql.functions import (
         col, from_json, lit, current_timestamp,
         to_timestamp, hour, dayofweek,
+        when, split, trim, round as spark_round,
     )
     from pyspark.sql.types import DoubleType
-
-    congestion_level_udf, congestion_score_udf, first_lat_udf, first_lon_udf, time_bucket_udf = udfs
 
     raw_schema = get_raw_schema()
 
@@ -194,6 +153,35 @@ def build_streaming_df(spark, udfs):
     ts_col    = to_timestamp(col("data_as_of"), "yyyy-MM-dd'T'HH:mm:ss.SSS")
     hour_col  = hour(ts_col)
     dow_col   = dayofweek(ts_col)   # 1=Sun … 7=Sat in Spark
+    is_weekend = (dow_col == 1) | (dow_col == 7)
+
+    # Native congestion_level (replaces Python UDF)
+    congestion_level_col = (
+        when(speed_col.isNull(), "UNKNOWN")
+        .when(speed_col >= 35, "FREE_FLOW")
+        .when(speed_col >= 15, "MODERATE")
+        .when(speed_col >= 5,  "CONGESTED")
+        .otherwise("SEVERE")
+    )
+
+    # Native congestion_score: 1.0 - min(speed/60, 1.0), rounded to 4dp
+    congestion_score_col = when(
+        speed_col.isNotNull(),
+        spark_round(lit(1.0) - when(speed_col >= 60, lit(1.0)).otherwise(speed_col / 60.0), 4)
+    ).otherwise(None)
+
+    # Native lat/lon extraction from "lat,lon lat,lon ..." string
+    first_pair  = split(trim(col("link_points")), " ").getItem(0)
+    lat_col     = split(first_pair, ",").getItem(0).cast(DoubleType())
+    lon_col     = split(first_pair, ",").getItem(1).cast(DoubleType())
+
+    # Native time_bucket (replaces Python UDF)
+    time_bucket_col = (
+        when(hour_col.between(0, 5), "OVERNIGHT")
+        .when(hour_col.between(7, 8)  & ~is_weekend, "MORNING_PEAK")
+        .when(hour_col.between(17, 18) & ~is_weekend, "EVENING_PEAK")
+        .otherwise("OFF_PEAK")
+    )
 
     enriched = (
         parsed
@@ -206,18 +194,17 @@ def build_streaming_df(spark, udfs):
         # Time features
         .withColumn("hour_of_day",  hour_col)
         .withColumn("day_of_week",  dow_col)
-        .withColumn("is_weekend",   (dow_col == 1) | (dow_col == 7))
+        .withColumn("is_weekend",   is_weekend)
         .withColumn("is_peak_hour",
-            ((hour_col.between(7, 8)) | (hour_col.between(17, 18))) &
-            ~((dow_col == 1) | (dow_col == 7))
+            ((hour_col.between(7, 8)) | (hour_col.between(17, 18))) & ~is_weekend
         )
-        .withColumn("time_bucket",  time_bucket_udf(hour_col, dow_col))
+        .withColumn("time_bucket",  time_bucket_col)
         # Location
-        .withColumn("latitude",  first_lat_udf(col("link_points")).cast(DoubleType()))
-        .withColumn("longitude", first_lon_udf(col("link_points")).cast(DoubleType()))
+        .withColumn("latitude",  lat_col)
+        .withColumn("longitude", lon_col)
         # Congestion
-        .withColumn("congestion_level", congestion_level_udf(speed_col))
-        .withColumn("congestion_score", congestion_score_udf(speed_col))
+        .withColumn("congestion_level", congestion_level_col)
+        .withColumn("congestion_score", congestion_score_col)
         # Lineage
         .withColumn("processed_at",       current_timestamp())
         .withColumn("phase",              lit("stream_processing"))
@@ -333,8 +320,7 @@ def main():
     spark = build_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
-    udfs     = register_udfs(spark)
-    enriched = build_streaming_df(spark, udfs)
+    enriched = build_streaming_df(spark)
 
     query = (
         enriched.writeStream

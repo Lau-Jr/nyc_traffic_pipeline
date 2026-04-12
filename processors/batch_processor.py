@@ -38,6 +38,23 @@ LOOKBACK_HOURS         = int(os.getenv("BATCH_LOOKBACK_HOURS", "24"))
 BATCH_INTERVAL_MINUTES = int(os.getenv("BATCH_INTERVAL_MINUTES", "60"))
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _round(val, digits: int = 2):
+    if val is None:
+        return None
+    try:
+        return round(float(val), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_iso(val) -> str:
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return str(val)
+
+
 # ── Data Fetching ──────────────────────────────────────────────────────────────
 
 def fetch_from_mongodb(db, hours: int) -> pd.DataFrame:
@@ -346,20 +363,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _round(val, digits: int = 2):
-    if val is None:
-        return None
-    try:
-        return round(float(val), digits)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_iso(val) -> str:
-    if hasattr(val, "isoformat"):
-        return val.isoformat()
-    return str(val)
