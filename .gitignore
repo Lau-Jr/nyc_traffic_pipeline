@@ -62,3 +62,7 @@ volumes/
 
 # ── MongoDB local data ────────────────────────────────────────────────────────
 data/db/
+
+# ── Trained ML models (large binaries) ───────────────────────────────────────
+models/*.joblib
+models/*.pkl
