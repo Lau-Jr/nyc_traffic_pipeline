@@ -110,10 +110,15 @@ class TrafficPredictor:
         pred_speed = max(0.0, round(pred_speed, 2))
 
         # ── Anomaly detection ──────────────────────────────────────
-        # congestion_score = 1 - min(speed/60, 1.0); use predicted if missing
-        if df["congestion_score"].iloc[0] == 0 or pd.isna(df["congestion_score"].iloc[0]) if "congestion_score" in df.columns else True:
-            speed_val = record.get("speed") or pred_speed
-            cong_score = round(1.0 - min(speed_val / 60.0, 1.0), 4) if speed_val else 0.5
+        # Safely compute congestion_score — avoid KeyError if column missing
+        has_score = (
+            "congestion_score" in df.columns
+            and not pd.isna(df["congestion_score"].iloc[0])
+            and df["congestion_score"].iloc[0] != 0
+        )
+        if not has_score:
+            speed_val  = float(record.get("speed") or pred_speed or 0.0)
+            cong_score = round(1.0 - min(speed_val / 60.0, 1.0), 4)
             df["congestion_score"] = cong_score
 
         X_anom      = build_X(df, ANOMALY_FEATURE_COLS)

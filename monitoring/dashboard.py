@@ -69,7 +69,8 @@ def mongo_ok() -> bool:
 
 @st.cache_data(ttl=REFRESH_SECS)
 def fetch_recent_records(hours: int = 1, boroughs: list | None = None, limit: int = 2000) -> pd.DataFrame:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # Use naive UTC datetime — processed_at is stored as naive datetime by Spark
+    since = datetime.utcnow() - timedelta(hours=hours)
     filt: dict = {"processed_at": {"$gte": since}}
     if boroughs:
         filt["borough"] = {"$in": boroughs}
@@ -88,11 +89,11 @@ def fetch_recent_records(hours: int = 1, boroughs: list | None = None, limit: in
         )
         df = pd.DataFrame(docs)
         if not df.empty:
-            df["speed"]           = pd.to_numeric(df["speed"],           errors="coerce")
-            df["travel_time"]     = pd.to_numeric(df["travel_time"],     errors="coerce")
-            df["congestion_score"]= pd.to_numeric(df["congestion_score"],errors="coerce")
-            df["latitude"]        = pd.to_numeric(df["latitude"],        errors="coerce")
-            df["longitude"]       = pd.to_numeric(df["longitude"],       errors="coerce")
+            df["speed"]            = pd.to_numeric(df["speed"],            errors="coerce")
+            df["travel_time"]      = pd.to_numeric(df["travel_time"],      errors="coerce")
+            df["congestion_score"] = pd.to_numeric(df["congestion_score"], errors="coerce")
+            df["latitude"]         = pd.to_numeric(df["latitude"],         errors="coerce")
+            df["longitude"]        = pd.to_numeric(df["longitude"],        errors="coerce")
         return df
     except Exception:
         return pd.DataFrame()
@@ -100,8 +101,9 @@ def fetch_recent_records(hours: int = 1, boroughs: list | None = None, limit: in
 
 @st.cache_data(ttl=30)
 def fetch_aggregations(hours: int = 24, boroughs: list | None = None) -> pd.DataFrame:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    filt: dict = {"window_start": {"$gte": since}}
+    # window_start is stored as an ISO string — filter using string comparison
+    since_str = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+    filt: dict = {"window_start": {"$gte": since_str}}
     if boroughs:
         filt["borough"] = {"$in": boroughs}
     try:
@@ -111,12 +113,22 @@ def fetch_aggregations(hours: int = 24, boroughs: list | None = None) -> pd.Data
             .sort("window_start", 1)
             .limit(5000)
         )
+        # Fallback: if no docs in window, return all available data
+        if not docs:
+            docs = list(
+                get_mongo()[MONGO_DB]["traffic_aggregated"]
+                .find({} if not boroughs else {"borough": {"$in": boroughs}}, {"_id": 0})
+                .sort("window_start", 1)
+                .limit(5000)
+            )
         df = pd.DataFrame(docs)
         if not df.empty:
             for col in ["avg_speed", "min_speed", "max_speed", "avg_congestion_score",
                         "record_count", "avg_travel_time"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "window_start" in df.columns:
+                df["window_start"] = pd.to_datetime(df["window_start"], utc=True, errors="coerce")
         return df
     except Exception:
         return pd.DataFrame()
@@ -124,22 +136,41 @@ def fetch_aggregations(hours: int = 24, boroughs: list | None = None) -> pd.Data
 
 @st.cache_data(ttl=30)
 def fetch_quality_metrics(hours: int = 24) -> pd.DataFrame:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # recorded_at is stored as an ISO string — fetch recent docs and filter in Python
+    since_str = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     try:
         docs = list(
             get_mongo()[MONGO_DB]["data_quality_metrics"]
-            .find({"recorded_at": {"$gte": since}}, {"_id": 0})
-            .sort("recorded_at", 1)
-            .limit(1000)
+            .find({}, {"_id": 0})
+            .sort("recorded_at", -1)
+            .limit(500)
         )
         df = pd.DataFrame(docs)
         if not df.empty:
             for col in ["quality_score", "total_records", "valid_records"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Filter to requested window using string comparison (ISO format sorts correctly)
+            if "recorded_at" in df.columns:
+                df = df[df["recorded_at"] >= since_str]
+                df = df.sort_values("recorded_at")
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_resource
+def load_predictor():
+    """Load and cache the TrafficPredictor once across all rerenders."""
+    try:
+        from analytics.predictor import TrafficPredictor
+        p = TrafficPredictor()
+        if p.models_exist():
+            p.load()
+            return p
+    except Exception:
+        pass
+    return None
 
 
 def load_producer_stats() -> dict:
@@ -216,12 +247,11 @@ with tab1:
     if not dq.empty and "quality_score" in dq.columns:
         quality_score = round(dq["quality_score"].mean(), 1)
 
-    # Try loading anomaly detector for count
+    # Try anomaly count using cached predictor
     try:
-        from analytics.predictor import get_predictor
-        pred = get_predictor()
-        if pred.models_exist() and not df.empty:
-            sample = df.head(200).to_dict(orient="records")
+        pred = load_predictor()
+        if pred is not None and not df.empty:
+            sample = df.head(100).to_dict(orient="records")
             preds  = pred.predict_batch(sample)
             anomaly_count = sum(1 for p in preds if p.get("is_anomaly"))
     except Exception:
@@ -401,125 +431,125 @@ with tab3:
     if not models_ready:
         st.warning("ML models not found. Run `python -m analytics.train` first.")
     else:
-        try:
-            from analytics.predictor import get_predictor
-            predictor = get_predictor()
-            if not predictor.is_ready():
-                predictor.load()
+        predictor = load_predictor()
+        if predictor is None:
+            st.error("Failed to load ML models.")
+        else:
+            try:
+                df_raw = fetch_recent_records(
+                    hours=min(time_hours, 3),
+                    boroughs=selected_boroughs or None,
+                    limit=300,
+                )
 
-            df_raw = fetch_recent_records(
-                hours=min(time_hours, 3),
-                boroughs=selected_boroughs or None,
-                limit=500,
-            )
+                if df_raw.empty:
+                    st.info("No recent records to score. Ensure the stream processor is running.")
+                else:
+                    with st.spinner("Running ML predictions…"):
+                        df_pred = predictor.predict_dataframe(df_raw.head(200).copy())
 
-            if df_raw.empty:
-                st.info("No recent records to score. Ensure the stream processor is running.")
-            else:
-                with st.spinner("Running ML predictions…"):
-                    df_pred = predictor.predict_dataframe(df_raw.copy())
+                    # ── ML KPIs ───────────────────────────────────────────────
+                    m1, m2, m3, m4 = st.columns(4)
+                    n_anomalies  = int(df_pred["is_anomaly"].sum()) if "is_anomaly" in df_pred.columns else 0
+                    avg_conf     = df_pred["congestion_confidence"].mean() if "congestion_confidence" in df_pred.columns else 0
+                    avg_pred_spd = df_pred["predicted_speed"].mean() if "predicted_speed" in df_pred.columns else 0
+                    anom_pct     = round(n_anomalies / max(len(df_pred), 1) * 100, 1)
 
-                # ── ML KPIs ───────────────────────────────────────────────────
-                m1, m2, m3, m4 = st.columns(4)
-                n_anomalies  = df_pred["is_anomaly"].sum() if "is_anomaly" in df_pred.columns else 0
-                avg_conf     = df_pred["congestion_confidence"].mean() if "congestion_confidence" in df_pred.columns else 0
-                avg_pred_spd = df_pred["predicted_speed"].mean() if "predicted_speed" in df_pred.columns else 0
-                anom_pct     = round(n_anomalies / max(len(df_pred), 1) * 100, 1)
+                    m1.metric("Records Scored",           f"{len(df_pred):,}")
+                    m2.metric("Anomalies Detected",       f"{n_anomalies}",
+                              delta=f"{anom_pct}% of records",
+                              delta_color="inverse" if n_anomalies > 0 else "off")
+                    m3.metric("Avg Prediction Confidence", f"{avg_conf*100:.1f}%")
+                    m4.metric("Avg Predicted Speed",       f"{avg_pred_spd:.1f} mph")
 
-                m1.metric("Records Scored",    f"{len(df_pred):,}")
-                m2.metric("Anomalies Detected",f"{int(n_anomalies)}",
-                          delta=f"{anom_pct}% of records",
-                          delta_color="inverse" if n_anomalies > 0 else "off")
-                m3.metric("Avg Prediction Confidence", f"{avg_conf*100:.1f}%")
-                m4.metric("Avg Predicted Speed",       f"{avg_pred_spd:.1f} mph")
+                    st.divider()
+                    col_l, col_r = st.columns(2)
 
-                st.divider()
-                col_l, col_r = st.columns(2)
+                    # ── Predicted vs Actual congestion ────────────────────────
+                    with col_l:
+                        if "predicted_congestion" in df_pred.columns and "congestion_level" in df_pred.columns:
+                            comparison = (
+                                df_pred.groupby(["congestion_level", "predicted_congestion"])
+                                .size().reset_index(name="count")
+                            )
+                            fig_cmp = px.bar(
+                                comparison,
+                                x="congestion_level", y="count",
+                                color="predicted_congestion",
+                                color_discrete_map=CONGESTION_COLORS,
+                                title="Actual vs Predicted Congestion",
+                                labels={"congestion_level": "Actual", "count": "Records",
+                                        "predicted_congestion": "Predicted"},
+                                barmode="group",
+                            )
+                            fig_cmp.update_layout(height=360, margin=dict(t=40, b=0))
+                            st.plotly_chart(fig_cmp, use_container_width=True)
 
-                # ── Predicted vs Actual congestion ────────────────────────────
-                with col_l:
-                    if "predicted_congestion" in df_pred.columns and "congestion_level" in df_pred.columns:
-                        comparison = (
-                            df_pred.groupby(["congestion_level", "predicted_congestion"])
-                            .size().reset_index(name="count")
+                    # ── Anomaly score distribution ────────────────────────────
+                    with col_r:
+                        if "anomaly_score" in df_pred.columns:
+                            fig_anom = px.histogram(
+                                df_pred.dropna(subset=["anomaly_score"]),
+                                x="anomaly_score",
+                                color="is_anomaly",
+                                nbins=40,
+                                color_discrete_map={True: "#e74c3c", False: "#2ecc71"},
+                                title="Anomaly Score Distribution",
+                                labels={"anomaly_score": "Anomaly Score",
+                                        "is_anomaly": "Is Anomaly"},
+                                barmode="overlay",
+                            )
+                            fig_anom.add_vline(x=0, line_dash="dash", line_color="gray",
+                                               annotation_text="threshold")
+                            fig_anom.update_layout(height=360, margin=dict(t=40, b=0))
+                            st.plotly_chart(fig_anom, use_container_width=True)
+
+                    # ── Predicted vs Actual speed scatter ─────────────────────
+                    if "predicted_speed" in df_pred.columns and "speed" in df_pred.columns:
+                        df_scatter = df_pred.dropna(subset=["speed", "predicted_speed"])
+                        if not df_scatter.empty:
+                            fig_scatter = px.scatter(
+                                df_scatter,
+                                x="speed", y="predicted_speed",
+                                color="congestion_level",
+                                color_discrete_map=CONGESTION_COLORS,
+                                title="Actual vs Predicted Speed",
+                                labels={"speed": "Actual Speed (mph)",
+                                        "predicted_speed": "Predicted Speed (mph)"},
+                                opacity=0.6,
+                            )
+                            max_s = float(df_scatter[["speed", "predicted_speed"]].max().max())
+                            fig_scatter.add_shape(
+                                type="line", x0=0, y0=0, x1=max_s, y1=max_s,
+                                line=dict(dash="dash", color="gray"),
+                            )
+                            fig_scatter.update_layout(height=380, margin=dict(t=40, b=0))
+                            st.plotly_chart(fig_scatter, use_container_width=True)
+
+                    # ── Anomaly records table ─────────────────────────────────
+                    if n_anomalies > 0:
+                        st.subheader(f"⚠️ Anomaly Alerts ({n_anomalies} records)")
+                        anom_cols = [c for c in ["link_name", "borough", "speed",
+                                                 "congestion_level", "anomaly_score",
+                                                 "processed_at"]
+                                     if c in df_pred.columns]
+                        st.dataframe(
+                            df_pred[df_pred["is_anomaly"] == True][anom_cols].head(20),
+                            use_container_width=True, height=250,
                         )
-                        fig_cmp = px.bar(
-                            comparison,
-                            x="congestion_level", y="count",
-                            color="predicted_congestion",
-                            color_discrete_map=CONGESTION_COLORS,
-                            title="Actual vs Predicted Congestion",
-                            labels={"congestion_level": "Actual", "count": "Records",
-                                    "predicted_congestion": "Predicted"},
-                            barmode="group",
-                        )
-                        fig_cmp.update_layout(height=360, margin=dict(t=40, b=0))
-                        st.plotly_chart(fig_cmp, use_container_width=True)
 
-                # ── Anomaly score distribution ────────────────────────────────
-                with col_r:
-                    if "anomaly_score" in df_pred.columns:
-                        fig_anom = px.histogram(
-                            df_pred.dropna(subset=["anomaly_score"]),
-                            x="anomaly_score",
-                            color="is_anomaly",
-                            nbins=40,
-                            color_discrete_map={True: "#e74c3c", False: "#2ecc71"},
-                            title="Anomaly Score Distribution",
-                            labels={"anomaly_score": "Anomaly Score",
-                                    "is_anomaly": "Is Anomaly"},
-                            barmode="overlay",
-                        )
-                        fig_anom.add_vline(x=0, line_dash="dash", line_color="gray",
-                                           annotation_text="threshold")
-                        fig_anom.update_layout(height=360, margin=dict(t=40, b=0))
-                        st.plotly_chart(fig_anom, use_container_width=True)
+                    # ── Model metadata ────────────────────────────────────────
+                    with st.expander("Model Details"):
+                        for name in ["congestion_classifier", "speed_predictor", "anomaly_detector"]:
+                            meta_path = models_dir / f"{name}_metadata.json"
+                            if meta_path.exists():
+                                with open(meta_path) as f:
+                                    meta = json.load(f)
+                                st.write(f"**{name}**")
+                                st.json(meta)
 
-                # ── Predicted speed vs actual speed ───────────────────────────
-                if "predicted_speed" in df_pred.columns and "speed" in df_pred.columns:
-                    df_scatter = df_pred.dropna(subset=["speed", "predicted_speed"]).sample(
-                        min(500, len(df_pred))
-                    )
-                    fig_scatter = px.scatter(
-                        df_scatter,
-                        x="speed", y="predicted_speed",
-                        color="congestion_level",
-                        color_discrete_map=CONGESTION_COLORS,
-                        title="Actual vs Predicted Speed",
-                        labels={"speed": "Actual Speed (mph)",
-                                "predicted_speed": "Predicted Speed (mph)"},
-                        opacity=0.6,
-                    )
-                    # Perfect prediction line
-                    max_s = df_scatter[["speed", "predicted_speed"]].max().max()
-                    fig_scatter.add_shape(
-                        type="line", x0=0, y0=0, x1=max_s, y1=max_s,
-                        line=dict(dash="dash", color="gray"),
-                    )
-                    fig_scatter.update_layout(height=380, margin=dict(t=40, b=0))
-                    st.plotly_chart(fig_scatter, use_container_width=True)
-
-                # ── Anomaly records table ─────────────────────────────────────
-                if n_anomalies > 0:
-                    st.subheader(f"⚠️ Anomaly Alerts ({int(n_anomalies)} records)")
-                    anom_df = df_pred[df_pred["is_anomaly"] == True][[
-                        c for c in ["link_name", "borough", "speed",
-                                    "congestion_level", "anomaly_score", "processed_at"]
-                        if c in df_pred.columns
-                    ]].head(20)
-                    st.dataframe(anom_df, use_container_width=True, height=250)
-
-                # ── Model metadata ────────────────────────────────────────────
-                with st.expander("Model Details"):
-                    for name in ["congestion_classifier", "speed_predictor", "anomaly_detector"]:
-                        meta_path = models_dir / f"{name}_metadata.json"
-                        if meta_path.exists():
-                            with open(meta_path) as f:
-                                meta = json.load(f)
-                            st.json(meta)
-
-        except Exception as exc:
-            st.error(f"ML prediction error: {exc}")
+            except Exception as exc:
+                st.error(f"ML prediction error: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
