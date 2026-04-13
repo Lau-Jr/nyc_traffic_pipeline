@@ -126,9 +126,10 @@ def report_regressor(reg, X, y_true):
     # Speed bins accuracy
     bins   = [0, 5, 15, 35, 200]
     labels = ["SEVERE", "CONGESTED", "MODERATE", "FREE_FLOW"]
-    actual_bin = pd.cut(y_true,     bins=bins, labels=labels, right=False)
-    pred_bin   = pd.cut(pd.Series(y_pred), bins=bins, labels=labels, right=False)
-    bin_acc    = accuracy_score(actual_bin.dropna(), pred_bin[actual_bin.notna()])
+    actual_bin = pd.cut(y_true.values,  bins=bins, labels=labels, right=False)
+    pred_bin   = pd.cut(y_pred,         bins=bins, labels=labels, right=False)
+    valid_mask = ~pd.isnull(actual_bin) & ~pd.isnull(pred_bin)
+    bin_acc    = accuracy_score(actual_bin[valid_mask], pred_bin[valid_mask])
     print(f"\nBin-level accuracy (speed tier): {bin_acc:.4f}  ({bin_acc*100:.2f}%)")
 
     print("\nTop 10 Feature Importances:")
