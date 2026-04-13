@@ -123,10 +123,21 @@ def fetch_aggregations(hours: int = 24, boroughs: list | None = None) -> pd.Data
             )
         df = pd.DataFrame(docs)
         if not df.empty:
+            # Unpack nested speed_stats dict → flat columns
+            if "speed_stats" in df.columns:
+                speed_df = df["speed_stats"].apply(
+                    lambda x: x if isinstance(x, dict) else {}
+                ).apply(pd.Series)
+                for sub, target in [("avg", "avg_speed"), ("min", "min_speed"),
+                                    ("max", "max_speed"), ("median", "median_speed")]:
+                    if sub in speed_df.columns:
+                        df[target] = pd.to_numeric(speed_df[sub], errors="coerce")
+
             for col in ["avg_speed", "min_speed", "max_speed", "avg_congestion_score",
                         "record_count", "avg_travel_time"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+
             if "window_start" in df.columns:
                 df["window_start"] = pd.to_datetime(df["window_start"], utc=True, errors="coerce")
         return df
@@ -633,27 +644,39 @@ with tab4:
         # ── Borough comparison table ───────────────────────────────────────────
         st.subheader("Borough Performance Summary")
         if not df_agg.empty and "borough" in df_agg.columns:
-            summary = (
-                df_agg.groupby("borough")
-                .agg(
-                    avg_speed=("avg_speed", "mean"),
-                    min_speed=("min_speed", "min"),
-                    max_speed=("max_speed", "max"),
-                    avg_congestion=("avg_congestion_score", "mean"),
-                    total_records=("record_count", "sum"),
+            agg_spec = {}
+            rename_map = {"borough": "Borough"}
+            if "avg_speed" in df_agg.columns:
+                agg_spec["avg_speed"]        = ("avg_speed", "mean")
+                rename_map["avg_speed"]       = "Avg Speed (mph)"
+            if "min_speed" in df_agg.columns:
+                agg_spec["min_speed"]        = ("min_speed", "min")
+                rename_map["min_speed"]       = "Min Speed (mph)"
+            if "max_speed" in df_agg.columns:
+                agg_spec["max_speed"]        = ("max_speed", "max")
+                rename_map["max_speed"]       = "Max Speed (mph)"
+            if "avg_congestion_score" in df_agg.columns:
+                agg_spec["avg_congestion"]   = ("avg_congestion_score", "mean")
+                rename_map["avg_congestion"]  = "Avg Congestion Score"
+            if "avg_travel_time" in df_agg.columns:
+                agg_spec["avg_travel_time"]  = ("avg_travel_time", "mean")
+                rename_map["avg_travel_time"] = "Avg Travel Time (s)"
+            if "record_count" in df_agg.columns:
+                agg_spec["total_records"]    = ("record_count", "sum")
+                rename_map["total_records"]   = "Total Records"
+
+            if agg_spec:
+                summary = (
+                    df_agg.groupby("borough")
+                    .agg(**agg_spec)
+                    .round(2)
+                    .reset_index()
+                    .rename(columns=rename_map)
                 )
-                .round(2)
-                .reset_index()
-                .rename(columns={
-                    "borough": "Borough",
-                    "avg_speed": "Avg Speed",
-                    "min_speed": "Min Speed",
-                    "max_speed": "Max Speed",
-                    "avg_congestion": "Avg Congestion Score",
-                    "total_records": "Total Records",
-                })
-            )
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(df_agg.groupby("borough").size().reset_index(name="Batches"),
+                             use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
