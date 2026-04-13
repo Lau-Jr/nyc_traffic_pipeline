@@ -1,0 +1,20 @@
+{
+  "model": "IsolationForest",
+  "features": [
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "is_peak_hour",
+    "borough_encoded",
+    "latitude",
+    "longitude",
+    "congestion_score"
+  ],
+  "target": "anomaly_score",
+  "train_size": 88000,
+  "trained_at": "2026-04-13T05:09:15.032185+00:00",
+  "contamination": 0.05,
+  "train_anomaly_rate": 0.0498,
+  "score_mean": 0.0693,
+  "score_std": 0.0418
+}

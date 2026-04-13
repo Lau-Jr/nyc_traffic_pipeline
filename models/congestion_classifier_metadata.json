@@ -1,0 +1,63 @@
+{
+  "model": "RandomForestClassifier",
+  "features": [
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "is_peak_hour",
+    "borough_encoded",
+    "latitude",
+    "longitude"
+  ],
+  "target": "congestion_level",
+  "classes": [
+    "FREE_FLOW",
+    "MODERATE",
+    "CONGESTED",
+    "SEVERE"
+  ],
+  "train_size": 70400,
+  "test_size": 17600,
+  "trained_at": "2026-04-13T05:08:40.124017+00:00",
+  "accuracy": 0.8985,
+  "accuracy_pct": 89.85,
+  "classification_report": {
+    "FREE_FLOW": {
+      "precision": 0.9756028368794326,
+      "recall": 0.8815688285055114,
+      "f1-score": 0.9262052248855372,
+      "support": 7802.0
+    },
+    "MODERATE": {
+      "precision": 0.7044497895369813,
+      "recall": 0.8771995507300636,
+      "f1-score": 0.7813906953476738,
+      "support": 2671.0
+    },
+    "CONGESTED": {
+      "precision": 0.8660640920295809,
+      "recall": 0.8823775638342403,
+      "f1-score": 0.874144723201327,
+      "support": 2389.0
+    },
+    "SEVERE": {
+      "precision": 0.936116910229645,
+      "recall": 0.9463908822287885,
+      "f1-score": 0.9412258606213266,
+      "support": 4738.0
+    },
+    "accuracy": 0.8984659090909091,
+    "macro avg": {
+      "precision": 0.87055840716891,
+      "recall": 0.8968842063246509,
+      "f1-score": 0.8807416260139662,
+      "support": 17600.0
+    },
+    "weighted avg": {
+      "precision": 0.9089538498700761,
+      "recall": 0.8984659090909091,
+      "f1-score": 0.9012049763171827,
+      "support": 17600.0
+    }
+  }
+}
