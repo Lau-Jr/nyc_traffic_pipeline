@@ -104,4 +104,4 @@ def run_validation_consumer():
 
 
 if __name__ == "__main__":
-    run_validation_consumer()
+    run_validation_consumer() ## can i create many validator(for each partittion)

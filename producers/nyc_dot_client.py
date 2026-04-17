@@ -44,7 +44,7 @@ class NYCDOTClient:
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
-            "User-Agent": "NYC-Traffic-Pipeline/1.0 (capstone-project)",
+            "User-Agent": "NYC-Traffic-Pipeline/1.0 (capstone-project)", # to identify who is calling
         })
         if APP_TOKEN:
             self.session.headers["X-App-Token"] = APP_TOKEN
