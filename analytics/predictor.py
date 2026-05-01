@@ -1,23 +1,31 @@
 """
-Phase 3 – Real-Time Traffic Predictor
+Phase 3 – Real-Time Traffic Predictor (v2: imputer-aware)
 
-Loads the three trained models and exposes a simple API:
+Loads the three trained models AND their fitted imputers, then exposes a
+simple prediction API:
 
     predictor = TrafficPredictor()
     result = predictor.predict(record_dict)
-    # result = {
-    #   "predicted_congestion": "MODERATE",
-    #   "predicted_speed":      28.4,
-    #   "is_anomaly":           False,
-    #   "anomaly_score":        0.12,
+    # {
+    #   "predicted_congestion":  "MODERATE",
+    #   "congestion_confidence": 0.87,
+    #   "predicted_speed":       28.4,
+    #   "is_anomaly":            False,
+    #   "anomaly_score":         0.12,
     # }
 
-Can be used from:
-  - The batch processor (score historical records)
-  - A REST API endpoint (Phase 4)
+Each model has a paired FeatureImputer that was fit on training data only.
+The same imputer is applied at inference time so live records are
+preprocessed identically to training, with no leakage of post-train
+statistics.
+
+Used by:
   - The Streamlit dashboard (Phase 4)
+  - The optional REST API endpoint (bonus)
+  - Any downstream batch scoring job
 """
-import os
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional
 
@@ -27,51 +35,57 @@ import pandas as pd
 from loguru import logger
 
 from analytics.feature_engineering import (
-    FEATURE_COLS, SPEED_FEATURE_COLS,
+    CAUSAL_FEATURE_COLS, ANOMALY_FEATURE_COLS,
     build_X, decode_labels, record_to_features,
+    FeatureImputer,
 )
 
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
-# Anomaly detector uses extended features
-ANOMALY_FEATURE_COLS = FEATURE_COLS + ["congestion_score"]
+MODEL_NAMES = ["congestion_classifier", "speed_predictor", "anomaly_detector"]
 
 
 class TrafficPredictor:
     """
-    Wraps the three trained models (congestion classifier, speed predictor,
-    anomaly detector) and provides record-level and batch prediction.
-
-    Models are loaded lazily on first use so import is cheap.
+    Wraps the three trained models + their FeatureImputers and provides
+    record-level and batch prediction.  Models are loaded lazily so import
+    is cheap.
     """
 
     def __init__(self, models_dir: Optional[Path] = None):
         self._dir = Path(models_dir) if models_dir else MODELS_DIR
-        self._clf = None   # congestion classifier
-        self._reg = None   # speed predictor
-        self._iso = None   # anomaly detector
+        self._clf = self._reg = self._iso = None
+        self._imp_clf = self._imp_reg = self._imp_iso = None
         self._loaded = False
 
     # ── Loading ────────────────────────────────────────────────────────────────
 
     def load(self):
-        """Explicitly load all models from disk."""
-        self._clf = self._load_model("congestion_classifier")
-        self._reg = self._load_model("speed_predictor")
-        self._iso = self._load_model("anomaly_detector")
+        """Explicitly load all models + imputers from disk."""
+        self._clf, self._imp_clf = self._load_pair("congestion_classifier")
+        self._reg, self._imp_reg = self._load_pair("speed_predictor")
+        self._iso, self._imp_iso = self._load_pair("anomaly_detector")
         self._loaded = True
-        logger.info("TrafficPredictor: all models loaded")
+        logger.info("TrafficPredictor: all models + imputers loaded")
 
-    def _load_model(self, name: str):
-        path = self._dir / f"{name}.joblib"
-        if not path.exists():
+    def _load_pair(self, name: str):
+        model_path   = self._dir / f"{name}.joblib"
+        imputer_path = self._dir / f"{name}_imputer.joblib"
+
+        if not model_path.exists():
             raise FileNotFoundError(
-                f"Model not found: {path}\n"
+                f"Model not found: {model_path}\n"
                 "Run `python -m analytics.train` first."
             )
-        model = joblib.load(path)
-        logger.debug(f"Loaded {name} from {path}")
-        return model
+        model = joblib.load(model_path)
+
+        imputer = None
+        if imputer_path.exists():
+            imputer = FeatureImputer.load(imputer_path)
+        else:
+            logger.warning(f"No imputer found for {name} — predictions may "
+                           "differ from training preprocessing")
+        return model, imputer
 
     def _ensure_loaded(self):
         if not self._loaded:
@@ -81,54 +95,44 @@ class TrafficPredictor:
 
     def predict(self, record: dict) -> dict:
         """
-        Score a single record dict and return a prediction dict.
-
-        Input keys used (all optional — missing values are imputed):
-            hour_of_day, day_of_week, is_weekend, is_peak_hour,
-            borough, latitude, longitude, travel_time, speed, congestion_score
+        Score a single record dict.
 
         Returns:
             predicted_congestion : str  – FREE_FLOW / MODERATE / CONGESTED / SEVERE
             congestion_confidence: float – probability of predicted class (0–1)
             predicted_speed      : float – speed in mph
             is_anomaly           : bool
-            anomaly_score        : float – higher = more normal (IsolationForest convention)
+            anomaly_score        : float – higher = more normal (IsolationForest)
         """
         self._ensure_loaded()
         df = record_to_features(record)
 
-        # ── Congestion classification ──────────────────────────────
-        X_cls = build_X(df, FEATURE_COLS)
+        # ── Congestion classification ─────────────────────────────────
+        X_cls = build_X(df, CAUSAL_FEATURE_COLS)
+        if self._imp_clf:
+            X_cls = self._imp_clf.transform(X_cls)
         cls_label_int = self._clf.predict(X_cls)[0]
         cls_label     = decode_labels(pd.Series([cls_label_int])).iloc[0]
-        cls_proba     = self._clf.predict_proba(X_cls)[0].max()
+        cls_proba     = float(self._clf.predict_proba(X_cls)[0].max())
 
-        # ── Speed prediction ───────────────────────────────────────
-        # Use actual travel_time if available; 0 otherwise
-        X_spd = build_X(df, SPEED_FEATURE_COLS)
+        # ── Speed prediction ──────────────────────────────────────────
+        X_spd = build_X(df, CAUSAL_FEATURE_COLS)
+        if self._imp_reg:
+            X_spd = self._imp_reg.transform(X_spd)
         pred_speed = float(self._reg.predict(X_spd)[0])
         pred_speed = max(0.0, round(pred_speed, 2))
 
-        # ── Anomaly detection ──────────────────────────────────────
-        # Safely compute congestion_score — avoid KeyError if column missing
-        has_score = (
-            "congestion_score" in df.columns
-            and not pd.isna(df["congestion_score"].iloc[0])
-            and df["congestion_score"].iloc[0] != 0
-        )
-        if not has_score:
-            speed_val  = float(record.get("speed") or pred_speed or 0.0)
-            cong_score = round(1.0 - min(speed_val / 60.0, 1.0), 4)
-            df["congestion_score"] = cong_score
-
-        X_anom      = build_X(df, ANOMALY_FEATURE_COLS)
-        anom_pred   = self._iso.predict(X_anom)[0]          # 1=normal, -1=anomaly
-        anom_score  = float(self._iso.decision_function(X_anom)[0])
-        is_anomaly  = bool(anom_pred == -1)
+        # ── Anomaly detection ─────────────────────────────────────────
+        X_anom = build_X(df, ANOMALY_FEATURE_COLS)
+        if self._imp_iso:
+            X_anom = self._imp_iso.transform(X_anom)
+        anom_label = int(self._iso.predict(X_anom)[0])           # 1=normal, -1=anomaly
+        anom_score = float(self._iso.decision_function(X_anom)[0])
+        is_anomaly = bool(anom_label == -1)
 
         return {
             "predicted_congestion":  cls_label,
-            "congestion_confidence": round(float(cls_proba), 4),
+            "congestion_confidence": round(cls_proba, 4),
             "predicted_speed":       pred_speed,
             "is_anomaly":            is_anomaly,
             "anomaly_score":         round(anom_score, 4),
@@ -137,17 +141,14 @@ class TrafficPredictor:
     # ── Batch prediction ───────────────────────────────────────────────────────
 
     def predict_batch(self, records: list[dict]) -> list[dict]:
-        """
-        Score a list of records.  Returns a list of prediction dicts in the
-        same order as the input.
-        """
+        """Score a list of records.  Failures are logged and replaced with UNKNOWN."""
         self._ensure_loaded()
         results = []
         for rec in records:
             try:
                 results.append(self.predict(rec))
             except Exception as exc:
-                logger.warning(f"Prediction failed for record: {exc}")
+                logger.warning(f"Prediction failed: {exc}")
                 results.append({
                     "predicted_congestion":  "UNKNOWN",
                     "congestion_confidence": 0.0,
@@ -159,8 +160,8 @@ class TrafficPredictor:
 
     def predict_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Score a full pandas DataFrame (as returned by MongoDB fetch).
-        Adds prediction columns in-place and returns the augmented DataFrame.
+        Score a full pandas DataFrame.  Returns a new DataFrame with
+        prediction columns appended.
         """
         self._ensure_loaded()
         records  = df.to_dict(orient="records")
@@ -168,20 +169,16 @@ class TrafficPredictor:
         pred_df  = pd.DataFrame(preds)
         return pd.concat([df.reset_index(drop=True), pred_df], axis=1)
 
-    # ── Model info ─────────────────────────────────────────────────────────────
+    # ── Status ─────────────────────────────────────────────────────────────────
 
     def is_ready(self) -> bool:
-        """Return True if all models are loaded."""
         return self._loaded
 
     def models_exist(self) -> bool:
-        """Return True if all model files are present on disk."""
-        names = ["congestion_classifier", "speed_predictor", "anomaly_detector"]
-        return all((self._dir / f"{n}.joblib").exists() for n in names)
+        return all((self._dir / f"{n}.joblib").exists() for n in MODEL_NAMES)
 
 
 # ── Convenience singleton ──────────────────────────────────────────────────────
-# Import and call predict() anywhere without managing the object lifecycle.
 
 _predictor: Optional[TrafficPredictor] = None
 
