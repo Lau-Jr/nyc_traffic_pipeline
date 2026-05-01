@@ -17,6 +17,7 @@ import json
 import os
 from collections import Counter
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import pandas as pd
 import schedule
@@ -26,10 +27,20 @@ from pymongo import MongoClient, UpdateOne
 
 from storage.mongodb_client import (
     MONGO_URI, MONGO_DB,
-    COL_PROCESSED, COL_AGGREGATED, COL_DQ_METRICS,
-    setup_collections,
+    COL_PROCESSED, COL_AGGREGATED, COL_DQ_METRICS, COL_LINEAGE,
+    setup_collections, write_with_retry,
+    make_lineage_entry, record_lineage,
 )
 from processors.data_cleaner import clean_record
+
+PROCESSOR_VERSION = "2.1.0"
+
+BATCH_TRANSFORMATIONS = [
+    "fetch_from_mongodb_or_kafka",
+    "compute_hourly_borough_aggregations",
+    "compute_network_summary",
+    "compute_quality_metrics",
+]
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 KAFKA_SERVERS          = os.getenv("KAFKA_BOOTSTRAP_SERVERS",  "localhost:9092")
@@ -50,16 +61,42 @@ def _round(val, digits: int = 2):
 
 
 def _to_iso(val) -> str:
+    """DEPRECATED — use _to_datetime; kept for any legacy callers."""
     if hasattr(val, "isoformat"):
         return val.isoformat()
     return str(val)
+
+
+def _to_datetime(val) -> datetime:
+    """
+    Convert a pandas Timestamp / datetime / string into a tz-aware UTC datetime
+    suitable for storing as a BSON Date.  Returns naive UTC if the input has
+    no timezone info.
+    """
+    if val is None:
+        return None
+    if hasattr(val, "to_pydatetime"):    # pandas Timestamp
+        val = val.to_pydatetime()
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    # String fallback
+    try:
+        parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return datetime.now(timezone.utc)
 
 
 # ── Data Fetching ──────────────────────────────────────────────────────────────
 
 def fetch_from_mongodb(db, hours: int) -> pd.DataFrame:
     """Pull the last `hours` of stream-processed records from MongoDB."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # Use naive UTC to match Spark's current_timestamp() storage convention.
+    since = datetime.utcnow() - timedelta(hours=hours)
 
     projection = {
         "_id": 0,
@@ -157,7 +194,7 @@ def hourly_borough_aggregations(df: pd.DataFrame) -> list[dict]:
         if lvl not in agg.columns:
             agg[lvl] = 0
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     docs = []
     for _, row in agg.iterrows():
         total = int(row["record_count"])
@@ -168,7 +205,7 @@ def hourly_borough_aggregations(df: pd.DataFrame) -> list[dict]:
         }
         docs.append({
             "aggregation_type":    "hourly_borough",
-            "window_start":        _to_iso(row["window_hour"]),
+            "window_start":        _to_datetime(row["window_hour"]),  # BSON datetime
             "borough":             row["borough"],
             "record_count":        total,
             "speed_stats": {
@@ -181,12 +218,12 @@ def hourly_borough_aggregations(df: pd.DataFrame) -> list[dict]:
             "avg_congestion_score":     _round(row.get("avg_congestion_score"), 4),
             "congestion_distribution":  cong_dist,
             "congestion_pct":           cong_pct,
-            "computed_at":              now,
+            "computed_at":              now,                          # BSON datetime
         })
     return docs
 
 
-def network_summary(df: pd.DataFrame, window_start: str, window_end: str) -> dict:
+def network_summary(df: pd.DataFrame, window_start: datetime, window_end: datetime) -> dict:
     """Network-wide summary over the entire batch window."""
     if df.empty:
         return {}
@@ -206,22 +243,22 @@ def network_summary(df: pd.DataFrame, window_start: str, window_end: str) -> dic
 
     return {
         "aggregation_type":              "window_summary",
-        "window_start":                  window_start,
-        "window_end":                    window_end,
+        "window_start":                  _to_datetime(window_start),   # BSON datetime
+        "window_end":                    _to_datetime(window_end),     # BSON datetime
         "total_records":                 len(df),
         "network_avg_speed":             _round(df["speed"].mean() if "speed" in df.columns else None),
         "network_avg_congestion_score":  _round(df["congestion_score"].mean() if "congestion_score" in df.columns else None, 4),
         "congestion_distribution":       {k: int(v) for k, v in cong_dist.items()},
         "borough_record_counts":         {k: int(v) for k, v in borough_counts.items()},
         "peak_hour_pct":                 peak_pct,
-        "computed_at":                   datetime.now(timezone.utc).isoformat(),
+        "computed_at":                   datetime.now(timezone.utc),   # BSON datetime
     }
 
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 def upsert_aggregations(db, docs: list[dict]):
-    """Upsert all aggregation docs (safe to re-run on same window)."""
+    """Upsert all aggregation docs (safe to re-run on same window).  Retries on transient MongoDB errors."""
     if not docs:
         return
 
@@ -235,7 +272,10 @@ def upsert_aggregations(db, docs: list[dict]):
             flt["borough"] = doc["borough"]
         ops.append(UpdateOne(flt, {"$set": doc}, upsert=True))
 
-    result = db[COL_AGGREGATED].bulk_write(ops)
+    result = write_with_retry(
+        db[COL_AGGREGATED].bulk_write, ops,
+        op_name="aggregations_bulk_upsert",
+    )
     logger.info(
         f"Aggregations → upserted {result.upserted_count}, "
         f"modified {result.modified_count}"
@@ -268,30 +308,40 @@ def record_batch_quality(db, df: pd.DataFrame, batch_id: str):
     metric = {
         "batch_id":                batch_id,
         "source":                  "batch_processor",
-        "recorded_at":             datetime.now(timezone.utc).isoformat(),
+        "recorded_at":             datetime.now(timezone.utc),  # BSON datetime
         "total_records":           total,
         "valid_records":           total - null_speed - null_borough,
         "quality_score":           quality_score,
         "null_counts":             {"speed": null_speed, "borough": null_borough},
         "quality_flags_distribution": flags_dist,
     }
-    db[COL_DQ_METRICS].update_one(
+    write_with_retry(
+        db[COL_DQ_METRICS].update_one,
         {"batch_id": batch_id},
         {"$set": metric},
         upsert=True,
+        op_name="batch_quality_upsert",
     )
     logger.info(f"Quality metrics stored (score={quality_score}%)")
+    return {"quality_score": quality_score, "valid": total - null_speed - null_borough}
 
 
 # ── Main Batch Job ─────────────────────────────────────────────────────────────
 
 def run_batch():
-    batch_id  = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    logger.info(f"╔══ Batch job started: {batch_id} ══╗")
+    started_at = datetime.now(timezone.utc)
+    batch_id   = f"batch_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    logger.info(f"==== Batch job started: {batch_id} ====")
 
     client = MongoClient(MONGO_URI)
     db     = client[MONGO_DB]
     setup_collections(db)
+
+    status: str = "success"
+    errors: list = []
+    record_count: int = 0
+    quality_summary: Optional[dict] = None
+    source_type = "mongodb"
 
     try:
         df = fetch_from_mongodb(db, hours=LOOKBACK_HOURS)
@@ -299,41 +349,85 @@ def run_batch():
         if df.empty:
             logger.warning(f"No records in MongoDB for last {LOOKBACK_HOURS}h — trying Kafka backfill")
             df = backfill_from_kafka()
+            source_type = "kafka_backfill"
 
         if df.empty:
             logger.warning("No data available — skipping this batch run")
-            return
+            status = "skipped_empty"
+        else:
+            record_count = len(df)
+            logger.info(f"Processing {record_count:,} records")
 
-        logger.info(f"Processing {len(df)} records")
+            window_end   = started_at
+            window_start = started_at - timedelta(hours=LOOKBACK_HOURS)
 
-        window_end   = datetime.now(timezone.utc).isoformat()
-        window_start = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).isoformat()
+            # Hourly × borough aggregations
+            hourly_docs = hourly_borough_aggregations(df)
+            upsert_aggregations(db, hourly_docs)
+            logger.info(f"Stored {len(hourly_docs)} hourly aggregations")
 
-        # Hourly × borough aggregations
-        hourly_docs = hourly_borough_aggregations(df)
-        upsert_aggregations(db, hourly_docs)
-        logger.info(f"Stored {len(hourly_docs)} hourly aggregations")
+            # Network-wide summary
+            summary = network_summary(df, window_start, window_end)
+            if summary:
+                write_with_retry(
+                    db[COL_AGGREGATED].update_one,
+                    {"aggregation_type": "window_summary",
+                     "window_start": summary["window_start"]},
+                    {"$set": summary}, upsert=True,
+                    op_name="network_summary_upsert",
+                )
+                logger.info("Network summary stored")
 
-        # Network-wide summary
-        summary = network_summary(df, window_start, window_end)
-        if summary:
-            db[COL_AGGREGATED].update_one(
-                {"aggregation_type": "window_summary", "window_start": window_start},
-                {"$set": summary},
-                upsert=True,
-            )
-            logger.info("Network summary stored")
+            # Data quality metrics
+            quality_summary = record_batch_quality(db, df, batch_id)
 
-        # Data quality metrics
-        record_batch_quality(db, df, batch_id)
-
-        logger.info(f"╚══ Batch job complete: {batch_id} ══╝")
+        logger.info(f"==== Batch job complete: {batch_id} ====")
 
     except Exception as exc:
+        status = "failed"
+        errors.append(f"{type(exc).__name__}: {exc}")
         logger.error(f"Batch job failed: {exc}")
-        raise
+        # Re-raise after lineage is recorded
+        _raise = exc
+    else:
+        _raise = None
     finally:
+        # Always record lineage — even on failure
+        completed_at = datetime.now(timezone.utc)
+        try:
+            entry = make_lineage_entry(
+                phase             = "batch_processing",
+                processor         = "batch_processor",
+                processor_version = PROCESSOR_VERSION,
+                source = {
+                    "type":       source_type,
+                    "collection": COL_PROCESSED if source_type == "mongodb" else None,
+                    "topic":      KAFKA_TOPIC if source_type == "kafka_backfill" else None,
+                    "lookback_hours": LOOKBACK_HOURS,
+                },
+                destination = {
+                    "type":        "mongodb",
+                    "database":    MONGO_DB,
+                    "collection":  COL_AGGREGATED,
+                },
+                record_count    = record_count,
+                started_at      = started_at,
+                completed_at    = completed_at,
+                transformations = BATCH_TRANSFORMATIONS,
+                schema_version  = "1.0",
+                status          = status,
+                errors          = errors,
+                extra = {
+                    "batch_id":        batch_id,
+                    "quality_summary": quality_summary,
+                },
+            )
+            record_lineage(db, entry)
+        except Exception as lineage_exc:
+            logger.warning(f"Failed to record lineage: {lineage_exc}")
         client.close()
+        if _raise is not None:
+            raise _raise
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
