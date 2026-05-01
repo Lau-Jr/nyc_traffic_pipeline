@@ -1,5 +1,12 @@
 {
-  "model": "RandomForestClassifier",
+  "model_type": "RandomForestClassifier",
+  "target": "congestion_level",
+  "classes": [
+    "FREE_FLOW",
+    "MODERATE",
+    "CONGESTED",
+    "SEVERE"
+  ],
   "features": [
     "hour_of_day",
     "day_of_week",
@@ -9,55 +16,105 @@
     "latitude",
     "longitude"
   ],
-  "target": "congestion_level",
-  "classes": [
-    "FREE_FLOW",
-    "MODERATE",
-    "CONGESTED",
-    "SEVERE"
-  ],
-  "train_size": 70400,
-  "test_size": 17600,
-  "trained_at": "2026-04-13T05:08:40.124017+00:00",
-  "accuracy": 0.8985,
-  "accuracy_pct": 89.85,
-  "classification_report": {
+  "imputer_strategy": "median",
+  "imputer_statistics": {
+    "hour_of_day": 22.0,
+    "day_of_week": 1.0,
+    "is_weekend": 1.0,
+    "is_peak_hour": 0.0,
+    "borough_encoded": 2.0,
+    "latitude": 40.74047,
+    "longitude": -73.932161
+  },
+  "split_strategy": "temporal_70_15_15",
+  "cv_strategy": "TimeSeriesSplit_5folds",
+  "train_size": 216671,
+  "val_size": 46429,
+  "test_size": 46430,
+  "code_version": "3.0.0",
+  "git_commit": "87d180c4fdd705093fe4472138b3253a2f4c2f95",
+  "python_version": "3.11.4",
+  "sklearn_version": "1.4.0",
+  "trained_at": "2026-05-01T07:02:20.549516+00:00",
+  "platform": "Windows",
+  "data_signature": {
+    "record_count": 309530,
+    "min_processed_at": "2026-04-12 01:12:55.018000",
+    "max_processed_at": "2026-04-13 09:38:31.250000",
+    "sha256_prefix": "a77823ce64357c10"
+  },
+  "cv_f1_weighted": null,
+  "val_accuracy": 0.9335,
+  "test_accuracy": 0.9334,
+  "val_f1_weighted": 0.936,
+  "test_f1_weighted": 0.936,
+  "test_classification_report": {
     "FREE_FLOW": {
-      "precision": 0.9756028368794326,
-      "recall": 0.8815688285055114,
-      "f1-score": 0.9262052248855372,
-      "support": 7802.0
+      "precision": 0.9905899384726746,
+      "recall": 0.928811130802006,
+      "f1-score": 0.9587063127578423,
+      "support": 26521.0
     },
     "MODERATE": {
-      "precision": 0.7044497895369813,
-      "recall": 0.8771995507300636,
-      "f1-score": 0.7813906953476738,
-      "support": 2671.0
+      "precision": 0.7627065302911094,
+      "recall": 0.920083523158694,
+      "f1-score": 0.8340359631764604,
+      "support": 5268.0
     },
     "CONGESTED": {
-      "precision": 0.8660640920295809,
-      "recall": 0.8823775638342403,
-      "f1-score": 0.874144723201327,
-      "support": 2389.0
+      "precision": 0.7431362196409715,
+      "recall": 0.938646215405135,
+      "f1-score": 0.8295270369824664,
+      "support": 2999.0
     },
     "SEVERE": {
-      "precision": 0.936116910229645,
-      "recall": 0.9463908822287885,
-      "f1-score": 0.9412258606213266,
-      "support": 4738.0
+      "precision": 0.9670753064798598,
+      "recall": 0.9486342552825975,
+      "f1-score": 0.9577660220275779,
+      "support": 11642.0
     },
-    "accuracy": 0.8984659090909091,
+    "accuracy": 0.9334266637949602,
     "macro avg": {
-      "precision": 0.87055840716891,
-      "recall": 0.8968842063246509,
-      "f1-score": 0.8807416260139662,
-      "support": 17600.0
+      "precision": 0.8658769987211539,
+      "recall": 0.9340437811621081,
+      "f1-score": 0.8950088337360868,
+      "support": 46430.0
     },
     "weighted avg": {
-      "precision": 0.9089538498700761,
-      "recall": 0.8984659090909091,
-      "f1-score": 0.9012049763171827,
-      "support": 17600.0
+      "precision": 0.9428544044916901,
+      "recall": 0.9334266637949602,
+      "f1-score": 0.9359813738320011,
+      "support": 46430.0
     }
+  },
+  "best_params": {
+    "bootstrap": true,
+    "ccp_alpha": 0.0,
+    "class_weight": "balanced",
+    "criterion": "gini",
+    "max_depth": 12,
+    "max_features": "sqrt",
+    "max_leaf_nodes": null,
+    "max_samples": null,
+    "min_impurity_decrease": 0.0,
+    "min_samples_leaf": 5,
+    "min_samples_split": 2,
+    "min_weight_fraction_leaf": 0.0,
+    "monotonic_cst": null,
+    "n_estimators": 200,
+    "n_jobs": -1,
+    "oob_score": false,
+    "random_state": 42,
+    "verbose": 0,
+    "warm_start": false
+  },
+  "feature_importances": {
+    "hour_of_day": 0.0432,
+    "day_of_week": 0.0212,
+    "is_weekend": 0.0,
+    "is_peak_hour": 0.0,
+    "borough_encoded": 0.083,
+    "latitude": 0.4384,
+    "longitude": 0.4142
   }
 }

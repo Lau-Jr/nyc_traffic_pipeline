@@ -1,20 +1,48 @@
 {
-  "model": "IsolationForest",
+  "model_type": "IsolationForest",
   "features": [
+    "speed",
+    "travel_time",
     "hour_of_day",
     "day_of_week",
     "is_weekend",
     "is_peak_hour",
     "borough_encoded",
     "latitude",
-    "longitude",
-    "congestion_score"
+    "longitude"
   ],
-  "target": "anomaly_score",
-  "train_size": 88000,
-  "trained_at": "2026-04-13T05:09:15.032185+00:00",
+  "imputer_strategy": "median",
+  "imputer_statistics": {
+    "speed": 36.66,
+    "travel_time": 121.0,
+    "hour_of_day": 22.0,
+    "day_of_week": 1.0,
+    "is_weekend": 1.0,
+    "is_peak_hour": 0.0,
+    "borough_encoded": 2.0,
+    "latitude": 40.74047,
+    "longitude": -73.932161
+  },
+  "split_strategy": "temporal_70_15_15",
+  "train_size": 216671,
+  "test_size": 46430,
+  "code_version": "3.0.0",
+  "git_commit": "87d180c4fdd705093fe4472138b3253a2f4c2f95",
+  "python_version": "3.11.4",
+  "sklearn_version": "1.4.0",
+  "trained_at": "2026-05-01T07:02:20.549516+00:00",
+  "platform": "Windows",
+  "data_signature": {
+    "record_count": 309530,
+    "min_processed_at": "2026-04-12 01:12:55.018000",
+    "max_processed_at": "2026-04-13 09:38:31.250000",
+    "sha256_prefix": "a77823ce64357c10"
+  },
   "contamination": 0.05,
-  "train_anomaly_rate": 0.0498,
-  "score_mean": 0.0693,
-  "score_std": 0.0418
+  "train_anomaly_rate": 0.0499,
+  "test_anomaly_rate": 0.039,
+  "train_score_mean": 0.0784,
+  "train_score_std": 0.0404,
+  "test_score_mean": 0.0881,
+  "test_score_std": 0.0384
 }
