@@ -18,6 +18,7 @@ Or locally with pyspark installed and SPARK_PACKAGES set in env.
 import os
 import sys
 from datetime import datetime, timezone
+from typing import Optional
 
 # ── Windows: point Spark workers at the current venv Python ───────────────────
 # Without this, Spark calls bare "python" which Windows aliases to the
@@ -43,7 +44,9 @@ MONGO_DB          = os.getenv("MONGO_DB",                 "nyc_traffic")
 MONGO_COL         = "traffic_processed"
 DQ_COL            = "data_quality_metrics"
 TRIGGER_SECS      = int(os.getenv("TRIGGER_INTERVAL_SECONDS", "5"))
-CHECKPOINT_DIR    = os.getenv("CHECKPOINT_DIR",           "/app/checkpoints/stream")
+CHECKPOINT_DIR    = os.getenv("CHECKPOINT_DIR",
+                              os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                           "checkpoints", "stream"))
 PROCESSOR_VERSION = "2.0.0"
 
 SPARK_PACKAGES = (
@@ -125,14 +128,21 @@ def build_streaming_df(spark):
 
     raw_schema = get_raw_schema()
 
-    # Read raw bytes from Kafka
+    # Read raw bytes from Kafka.
+    #
+    # failOnDataLoss=false: tolerates partition count changes or topic
+    # recreation between runs (e.g. local dev / topic reset).  Data that
+    # was aged out of Kafka is silently skipped rather than crashing the
+    # stream.  For production with strict SLAs, set to "true" and ensure
+    # Kafka retention >= LOOKBACK_HOURS.
     raw_stream = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_SERVERS)
         .option("subscribe",               KAFKA_TOPIC)
-        .option("startingOffsets",         "latest")
+        .option("startingOffsets",         "earliest")
         .option("failOnDataLoss",          "false")
+        .option("maxOffsetsPerTrigger",    "10000")
         .load()
     )
 
@@ -217,70 +227,164 @@ def build_streaming_df(spark):
 
 
 # ── Batch Write Callback ───────────────────────────────────────────────────────
+#
+# Each foreachBatch invocation produces three writes:
+#   1. Processed records  → traffic_processed       (Mongo Spark Connector)
+#   2. Quality metrics    → data_quality_metrics    (PyMongo, with retry)
+#   3. Lineage entry      → data_lineage            (PyMongo, with retry)
+#
+# All writes that go through PyMongo use exponential-backoff retry.  The
+# Mongo Spark Connector handles its own retries internally per the
+# `retryWrites=true` URI flag.  Timestamps are stored as native BSON
+# datetime (NOT ISO strings) so they sort and compare correctly in MongoDB.
+
+TRANSFORMATIONS_APPLIED = [
+    "kafka_json_parse",
+    "type_cast_numeric",
+    "extract_timestamp",
+    "extract_time_features",
+    "extract_lat_lon",
+    "compute_congestion_level",
+    "compute_congestion_score",
+    "compute_time_bucket",
+    "attach_processing_lineage",
+]
+
 
 def write_batch(batch_df, batch_id: int):
     """
-    foreachBatch handler:
-      1. Write processed records to MongoDB traffic_processed
-      2. Compute and store data quality metrics
+    foreachBatch handler — write processed records + quality metrics +
+    lineage entry, all with retry semantics.  Captures Kafka offset range
+    for full provenance.
     """
+    started_at = datetime.now(timezone.utc)
     count = batch_df.count()
+
     if count == 0:
         logger.debug(f"Batch {batch_id}: empty, skipping")
         return
 
-    ts_str = datetime.now(timezone.utc).isoformat()
-    logger.info(f"Batch {batch_id}: writing {count} records → MongoDB")
+    logger.info(f"Batch {batch_id}: writing {count:,} records → MongoDB")
 
-    # ── Write processed records ────────────────────────────────────────────
-    (
-        batch_df.write
-        .format("mongodb")
-        .mode("append")
-        .option("database",   MONGO_DB)
-        .option("collection", MONGO_COL)
-        .save()
+    # ── Capture Kafka offset range for lineage (before drops) ─────────────
+    offset_range = _capture_offset_range(batch_df)
+
+    # ── 1. Write processed records (retried internally by connector) ──────
+    write_status = "success"
+    write_errors: list[str] = []
+    try:
+        (
+            batch_df.write
+            .format("mongodb")
+            .mode("append")
+            .option("database",   MONGO_DB)
+            .option("collection", MONGO_COL)
+            .save()
+        )
+    except Exception as exc:
+        write_status = "failed"
+        write_errors.append(f"records_write: {type(exc).__name__}: {exc}")
+        logger.error(f"Batch {batch_id}: record write failed: {exc}")
+        # Continue to record lineage even on partial failure — provenance
+        # of the failure itself is valuable for debugging.
+
+    # ── 2. Quality metrics (retried) ──────────────────────────────────────
+    quality_summary = None
+    try:
+        quality_summary = _record_quality_metrics(batch_df, batch_id, count, started_at)
+    except Exception as exc:
+        write_errors.append(f"quality_metrics: {type(exc).__name__}: {exc}")
+        logger.warning(f"Batch {batch_id}: quality metrics failed: {exc}")
+
+    # ── 3. Lineage entry (retried, never raises) ──────────────────────────
+    completed_at = datetime.now(timezone.utc)
+    _record_lineage_entry(
+        batch_id=batch_id,
+        record_count=count,
+        offset_range=offset_range,
+        started_at=started_at,
+        completed_at=completed_at,
+        status=write_status if not write_errors else "partial",
+        errors=write_errors,
+        quality_summary=quality_summary,
     )
 
-    # ── Data quality metrics ───────────────────────────────────────────────
-    _record_quality_metrics(batch_df, batch_id, count, ts_str)
+    duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+    if write_status == "success" and not write_errors:
+        logger.info(f"Batch {batch_id}: OK in {duration_ms}ms")
+    else:
+        logger.warning(f"Batch {batch_id}: completed with errors in {duration_ms}ms — see lineage")
 
-    logger.info(f"Batch {batch_id}: done ✓")
+
+def _capture_offset_range(df) -> dict:
+    """
+    Extract min/max Kafka offset per partition for this micro-batch.
+    Used in the lineage entry so any record range can be replayed deterministically.
+    """
+    from pyspark.sql.functions import min as spark_min, max as spark_max, count as spark_count
+
+    try:
+        offsets = (
+            df.groupBy("kafka_partition")
+            .agg(
+                spark_min("kafka_offset").alias("min_offset"),
+                spark_max("kafka_offset").alias("max_offset"),
+                spark_count("kafka_offset").alias("count"),
+            )
+            .collect()
+        )
+        return {
+            f"partition_{row['kafka_partition']}": {
+                "min_offset": int(row["min_offset"]),
+                "max_offset": int(row["max_offset"]),
+                "count":      int(row["count"]),
+            }
+            for row in offsets
+        }
+    except Exception as exc:
+        logger.warning(f"Could not capture offset range: {exc}")
+        return {}
 
 
-def _record_quality_metrics(df, batch_id: int, total: int, ts_str: str):
-    from pymongo import MongoClient
+def _record_quality_metrics(df, batch_id: int, total: int, started_at: datetime) -> dict:
+    """
+    Compute quality stats and upsert into data_quality_metrics.
+    Returns a brief summary used in the lineage entry.
+    """
     from pyspark.sql.functions import col
+    from storage.mongodb_client import write_with_retry, get_client
 
-    null_speed   = df.filter(col("speed").isNull()).count()
-    null_borough = df.filter(col("borough").isNull()).count()
-    null_ts      = df.filter(col("data_as_of_parsed").isNull()).count()
-    zero_speed   = df.filter(col("speed") == 0).count()
-    unknown_cong = df.filter(col("congestion_level") == "UNKNOWN").count()
-
-    valid = total - null_speed - null_borough - null_ts
-    quality_score = round(valid / total * 100, 2) if total > 0 else 0.0
+    df_cached = df.cache()
+    null_speed   = df_cached.filter(col("speed").isNull()).count()
+    null_borough = df_cached.filter(col("borough").isNull()).count()
+    null_ts      = df_cached.filter(col("data_as_of_parsed").isNull()).count()
+    zero_speed   = df_cached.filter(col("speed") == 0).count()
+    unknown_cong = df_cached.filter(col("congestion_level") == "UNKNOWN").count()
 
     borough_dist = {
         row["borough"]: row["count"]
-        for row in df.groupBy("borough").count().collect()
+        for row in df_cached.groupBy("borough").count().collect()
         if row["borough"]
     }
     congestion_dist = {
         row["congestion_level"]: row["count"]
-        for row in df.groupBy("congestion_level").count().collect()
+        for row in df_cached.groupBy("congestion_level").count().collect()
     }
+    df_cached.unpersist()
+
+    valid = total - null_speed - null_borough - null_ts
+    quality_score = round(valid / total * 100, 2) if total > 0 else 0.0
 
     metric = {
-        "batch_id":    f"stream_{batch_id}",
-        "source":      "spark_stream_processor",
-        "recorded_at": ts_str,
+        "batch_id":       f"stream_{batch_id}",
+        "source":         "spark_stream_processor",
+        "recorded_at":    started_at,                 # native datetime, not string
         "total_records":  total,
         "valid_records":  valid,
         "quality_score":  quality_score,
         "null_counts": {
-            "speed":    null_speed,
-            "borough":  null_borough,
+            "speed":      null_speed,
+            "borough":    null_borough,
             "data_as_of": null_ts,
         },
         "anomalies": {
@@ -291,13 +395,68 @@ def _record_quality_metrics(df, batch_id: int, total: int, ts_str: str):
         "congestion_distribution": congestion_dist,
     }
 
-    client = MongoClient(MONGO_URI)
+    client = get_client()
     try:
-        client[MONGO_DB][DQ_COL].update_one(
+        write_with_retry(
+            client[MONGO_DB][DQ_COL].update_one,
             {"batch_id": metric["batch_id"]},
             {"$set": metric},
             upsert=True,
+            op_name="quality_metrics_upsert",
         )
+    finally:
+        client.close()
+
+    return {
+        "quality_score": quality_score,
+        "valid_records": valid,
+        "null_speed":    null_speed,
+        "zero_speed":    zero_speed,
+    }
+
+
+def _record_lineage_entry(
+    *, batch_id: int, record_count: int, offset_range: dict,
+    started_at: datetime, completed_at: datetime,
+    status: str, errors: list, quality_summary: Optional[dict] = None,
+):
+    """Record a structured lineage entry for this micro-batch."""
+    from storage.mongodb_client import (
+        get_client, make_lineage_entry, record_lineage,
+    )
+
+    entry = make_lineage_entry(
+        phase             = "stream_processing",
+        processor         = "spark_stream_processor",
+        processor_version = PROCESSOR_VERSION,
+        source = {
+            "type":             "kafka",
+            "topic":            KAFKA_TOPIC,
+            "bootstrap_servers": KAFKA_SERVERS,
+            "partition_offsets": offset_range,
+        },
+        destination = {
+            "type":       "mongodb",
+            "database":   MONGO_DB,
+            "collection": MONGO_COL,
+        },
+        record_count    = record_count,
+        started_at      = started_at,
+        completed_at    = completed_at,
+        transformations = TRANSFORMATIONS_APPLIED,
+        schema_version  = "1.0",
+        status          = status,
+        errors          = errors,
+        extra = {
+            "spark_batch_id":   int(batch_id),
+            "trigger_seconds":  TRIGGER_SECS,
+            "quality_summary":  quality_summary,
+        },
+    )
+
+    client = get_client()
+    try:
+        record_lineage(client[MONGO_DB], entry)
     finally:
         client.close()
 
