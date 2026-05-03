@@ -129,9 +129,9 @@ def run_producer():
 
 
                 # ── 1. Dedup check ───────────────────────────────────────────
-                if key and key in _seen_ids:
-                    stats.duplicates += 1
-                    continue
+                # if key and key in _seen_ids:
+                #     stats.duplicates += 1
+                #     continue
 
                 # ── 2. Publish raw record — validation_consumer handles the rest
                 producer.send(
