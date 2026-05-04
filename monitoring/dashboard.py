@@ -38,7 +38,7 @@ st.set_page_config(
 MONGO_URI      = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB       = os.getenv("MONGO_DB",  "nyc_traffic")
 STATS_FILE     = Path(__file__).parent.parent / "logs" / "producer_stats.json"
-REFRESH_SECS   = 10
+REFRESH_SECS   = 60
 
 CONGESTION_COLORS = {
     "FREE_FLOW":  "#2ecc71",
