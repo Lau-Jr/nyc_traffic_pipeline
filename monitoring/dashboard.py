@@ -223,6 +223,17 @@ def load_predictor():
     return None
 
 
+@st.cache_data(ttl=10)
+def run_predictions(_predictor, df: pd.DataFrame) -> pd.DataFrame:
+    """Cache ML predictions — recomputes only when input data changes.
+
+    The leading underscore on _predictor tells Streamlit not to hash it
+    (TrafficPredictor is not hashable). The df argument IS hashed, so
+    predictions are reused for the same records within the 10-second TTL.
+    """
+    return _predictor.predict_dataframe(df.head(200).copy())
+
+
 def load_producer_stats() -> dict:
     if STATS_FILE.exists():
         try:
@@ -563,13 +574,13 @@ with tab1:
     if not dq.empty and "quality_score" in dq.columns:
         quality_score = round(dq["quality_score"].mean(), 1)
 
-    # Try anomaly count using cached predictor
+    # Try anomaly count using cached predictions
     try:
         pred = load_predictor()
         if pred is not None and not df.empty:
-            sample = df.head(100).to_dict(orient="records")
-            preds  = pred.predict_batch(sample)
-            anomaly_count = sum(1 for p in preds if p.get("is_anomaly"))
+            df_scored = run_predictions(pred, df.head(100))
+            if "is_anomaly" in df_scored.columns:
+                anomaly_count = int(df_scored["is_anomaly"].sum())
     except Exception:
         pass
 
@@ -775,7 +786,7 @@ with tab3:
                     st.info("No recent records to score. Ensure the stream processor is running.")
                 else:
                     with st.spinner("Running ML predictions…"):
-                        df_pred = predictor.predict_dataframe(df_raw.head(200).copy())
+                        df_pred = run_predictions(predictor, df_raw)
 
                     # ── ML KPIs ───────────────────────────────────────────────
                     m1, m2, m3, m4 = st.columns(4)
