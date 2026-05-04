@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="NYC Traffic Analytics",
-    page_icon="🚦",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -408,7 +408,7 @@ def health_banner(status: dict):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🚦 NYC Traffic")
+    st.title("NYC Traffic")
     st.caption("Real-Time Analytics Pipeline")
     st.divider()
 
@@ -469,7 +469,7 @@ st.markdown("""
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title("🚦 NYC Traffic Analytics Pipeline")
+st.title("NYC Traffic Analytics Pipeline")
 st.caption("Real-time traffic monitoring · Spark streaming · ML predictions · NYC DOT data")
 
 
@@ -485,12 +485,12 @@ health_banner(_health)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Overview",
-    "🗺️ Live Traffic",
-    "🤖 ML Insights",
-    "📈 Historical",
-    "✅ Data Quality",
-    "🔗 Lineage & Health",
+    "Overview",
+    "Live Traffic",
+    "ML Insights",
+    "Historical",
+    "Data Quality",
+    "Lineage & Health",
 ])
 
 
@@ -553,10 +553,10 @@ with tab1:
         # Narrative interpretation
         if avg_now and _exec_sum.get("baseline_speed"):
             if delta_pct and delta_pct < -5:
-                st.info(f"📉 Traffic is **{abs(delta_pct)}% slower** than the 7-day average. "
+                st.info(f"Traffic is **{abs(delta_pct)}% slower** than the 7-day average. "
                         f"Worst-affected borough: **{worst_b}** ({worst_s} mph).")
             elif delta_pct and delta_pct > 5:
-                st.success(f"📈 Traffic is **{delta_pct}% faster** than the 7-day average — flowing well.")
+                st.success(f"Traffic is **{delta_pct}% faster** than the 7-day average — flowing well.")
             else:
                 st.caption(f"Traffic is consistent with the 7-day baseline of {_exec_sum.get('baseline_speed')} mph.")
 
@@ -888,7 +888,7 @@ with tab3:
                         st.dataframe(anom_df, use_container_width=True, height=250)
                         # CSV download
                         st.download_button(
-                            "📥 Download anomalies (CSV)",
+                            "Download anomalies (CSV)",
                             data=anom_df.to_csv(index=False).encode("utf-8"),
                             file_name=f"anomalies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                             mime="text/csv",
@@ -899,7 +899,7 @@ with tab3:
                     # ════════════════════════════════════════════════════════════
                     # MODEL EXPLAINABILITY (Master's-level Explainable AI)
                     # ════════════════════════════════════════════════════════════
-                    st.subheader("🧠 Model Explainability")
+                    st.subheader("Model Explainability")
                     st.caption(
                         "How and why the models make their predictions — feature "
                         "importances from training, per-prediction breakdown, and "
@@ -983,7 +983,7 @@ with tab3:
                         c2.metric("Predicted Speed", f"{rec.get('predicted_speed', 0):.1f} mph")
                         actual_cong = rec.get("congestion_level", "—")
                         pred_cong   = rec.get("predicted_congestion", "—")
-                        match = "✅ correct" if actual_cong == pred_cong else "⚠️ differs"
+                        match = "correct" if actual_cong == pred_cong else "⚠️ differs"
                         c3.metric(
                             "Predicted Congestion",
                             pred_cong,
@@ -993,7 +993,7 @@ with tab3:
 
                         # Anomaly badge
                         if rec.get("is_anomaly"):
-                            st.error(f"🚨 Flagged as ANOMALY · score = {rec.get('anomaly_score', 0):.3f}")
+                            st.error(f"Flagged as ANOMALY · score = {rec.get('anomaly_score', 0):.3f}")
                         else:
                             st.success(f"✓ Normal record · anomaly score = {rec.get('anomaly_score', 0):.3f}")
 
@@ -1091,7 +1091,7 @@ with tab3:
                             st.info("No predicted_speed available for calibration analysis.")
 
                     # ── Model versioning / metadata ───────────────────────────
-                    with st.expander("📋 Model Versioning & Training Metadata"):
+                    with st.expander("Model Versioning & Training Metadata"):
                         for name, label in [
                             ("congestion_classifier", "Congestion Classifier"),
                             ("speed_predictor",       "Speed Predictor"),
@@ -1109,8 +1109,7 @@ with tab3:
                             mv3.metric("Train size",     f"{meta.get('train_size', '?'):,}"
                                        if isinstance(meta.get('train_size'), int) else "?")
                             mv4.metric("Trained at",     (meta.get("trained_at", "?") or "?")[:10])
-                            with st.expander(f"Full metadata — {name}"):
-                                st.json(meta)
+                            st.json(meta)
 
             except Exception as exc:
                 st.error(f"ML prediction error: {exc}")
@@ -1378,7 +1377,7 @@ with tab6:
         # Alert if success rate dropped
         if success_rate < 95 and total_batches >= 5:
             st.error(
-                f"🚨 Pipeline success rate is **{success_rate:.1f}%** "
+                f"Pipeline success rate is **{success_rate:.1f}%** "
                 f"({(lineage_df['status'] != 'success').sum()} failed batches in last {total_batches}). "
                 "Inspect the failed entries below."
             )
@@ -1481,14 +1480,14 @@ with tab6:
 
         # CSV export
         st.download_button(
-            "📥 Download lineage entries (CSV)",
+            "Download lineage entries (CSV)",
             data=lineage_df.head(200).to_csv(index=False).encode("utf-8"),
             file_name=f"lineage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
         )
 
         # ── Inspect a single lineage entry (drill-down) ────────────────────────
-        with st.expander("🔍 Inspect a single lineage entry"):
+        with st.expander("Inspect a single lineage entry"):
             if "lineage_id" in lineage_df.columns:
                 ids = lineage_df["lineage_id"].tolist()
                 selected = st.selectbox("Pick a batch:", options=ids, key="lineage_picker")
