@@ -425,7 +425,7 @@ with st.sidebar:
                   "Last 24 hours": 24, "Last 7 days": 168}[time_window]
 
     st.divider()
-    auto_refresh = st.toggle("Auto-refresh (10s)", value=True)
+    auto_refresh = st.toggle("Auto-refresh (60s)", value=True)
     if st.button("↻ Refresh now", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
